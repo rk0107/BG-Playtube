@@ -24,12 +24,15 @@ import android.webkit.WebViewClient
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
 import com.backgroundtube.data.SessionStore
+import com.backgroundtube.data.UserSettings
 import com.backgroundtube.playback.PlaybackCommand
 import com.backgroundtube.util.AppConstants
+import java.io.ByteArrayInputStream
 
 class WebViewManager(
     private val webView: WebView,
     private val sessionStore: SessionStore,
+    private val contentFilter: ContentFilter,
     private val listener: Listener
 ) {
     interface Listener {
@@ -48,12 +51,24 @@ class WebViewManager(
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val chromeClient = BackgroundTubeChromeClient()
+    private var currentSettings = UserSettings()
     private var lastReportedPlaying: Boolean? = null
     private var lastReportedTitle = ""
     private var lastPlaybackReportAt = 0L
 
     init {
         configureWebView()
+    }
+
+    fun applyUserSettings(settings: UserSettings) {
+        currentSettings = settings
+        contentFilter.updateSettings(settings)
+        applyDarkMode()
+        if (settings.enableBackgroundPlayback && settings.enableScreenOffPlayback) {
+            installBackgroundKeepAliveScript()
+        } else {
+            setBackgroundPlaybackMode(false)
+        }
     }
 
     fun loadInitialUrl() {
@@ -85,11 +100,26 @@ class WebViewManager(
 
     fun onResume() {
         webView.onResume()
+        setBackgroundPlaybackMode(false)
         requestPlaybackSnapshot()
     }
 
-    fun onPause() {
+    fun onPause(keepPlaybackAlive: Boolean) {
         sessionStore.saveLastUrl(currentUrl())
+        if (keepPlaybackAlive) {
+            installBackgroundKeepAliveScript()
+            setBackgroundPlaybackMode(true)
+            resumePrimaryMedia()
+        } else {
+            setBackgroundPlaybackMode(false)
+            webView.onPause()
+        }
+    }
+
+    fun prepareForBackgroundPlayback() {
+        installBackgroundKeepAliveScript()
+        setBackgroundPlaybackMode(true)
+        resumePrimaryMedia()
     }
 
     fun destroy() {
@@ -126,7 +156,9 @@ class WebViewManager(
             PlaybackCommand.PLAY -> evaluateJavascript(
                 """
                 (function() {
-                    var video = document.querySelector('video');
+                    window.__backgroundTubeUserPaused = false;
+                    window.__backgroundTubeShouldResume = true;
+                    var video = document.querySelector('video, audio');
                     if (video) {
                         var playPromise = video.play();
                         if (playPromise && playPromise.catch) {
@@ -141,7 +173,9 @@ class WebViewManager(
             PlaybackCommand.PAUSE -> evaluateJavascript(
                 """
                 (function() {
-                    var video = document.querySelector('video');
+                    window.__backgroundTubeUserPaused = true;
+                    window.__backgroundTubeShouldResume = false;
+                    var video = document.querySelector('video, audio');
                     if (video) {
                         video.pause();
                     }
@@ -153,7 +187,9 @@ class WebViewManager(
             PlaybackCommand.STOP -> evaluateJavascript(
                 """
                 (function() {
-                    var video = document.querySelector('video');
+                    window.__backgroundTubeUserPaused = true;
+                    window.__backgroundTubeShouldResume = false;
+                    var video = document.querySelector('video, audio');
                     if (video) {
                         video.pause();
                         try { video.currentTime = 0; } catch (ignored) {}
@@ -210,29 +246,61 @@ class WebViewManager(
                 }
 
                 window.__backgroundTubeObserverInstalled = true;
+                window.__backgroundTubeShouldResume = false;
+                window.__backgroundTubeUserPaused = false;
 
                 window.__backgroundTubeReportPlayback = function() {
                     try {
-                        var video = document.querySelector('video');
-                        var playing = !!video && !video.paused && !video.ended && video.readyState >= 2;
+                        var media = document.querySelector('video, audio');
+                        var playing = !!media && !media.paused && !media.ended && media.readyState >= 2;
                         var title = document.title || '';
                         BackgroundTubeBridge.postPlaybackState(playing, title);
                     } catch (ignored) {}
                 };
 
-                window.__backgroundTubeAttachVideoObservers = function() {
-                    var videos = document.querySelectorAll('video');
-                    for (var i = 0; i < videos.length; i++) {
-                        var video = videos[i];
-                        if (video.__backgroundTubeAttached) {
+                window.__backgroundTubeResumeIfNeeded = function() {
+                    try {
+                        var media = document.querySelector('video, audio');
+                        if (!media) return;
+                        if (
+                            window.__backgroundTubeKeepAliveEnabled &&
+                            window.__backgroundTubeBackgroundMode &&
+                            window.__backgroundTubeShouldResume &&
+                            !window.__backgroundTubeUserPaused &&
+                            media.paused &&
+                            !media.ended
+                        ) {
+                            var playPromise = media.play();
+                            if (playPromise && playPromise.catch) {
+                                playPromise.catch(function() {});
+                            }
+                        }
+                    } catch (ignored) {}
+                };
+
+                window.__backgroundTubeAttachMediaObservers = function() {
+                    var mediaNodes = document.querySelectorAll('video, audio');
+                    for (var i = 0; i < mediaNodes.length; i++) {
+                        var media = mediaNodes[i];
+                        if (media.__backgroundTubeAttached) {
                             continue;
                         }
-                        video.__backgroundTubeAttached = true;
-                        video.addEventListener('play', window.__backgroundTubeReportPlayback);
-                        video.addEventListener('pause', window.__backgroundTubeReportPlayback);
-                        video.addEventListener('ended', window.__backgroundTubeReportPlayback);
-                        video.addEventListener('loadedmetadata', window.__backgroundTubeReportPlayback);
-                        video.addEventListener('timeupdate', window.__backgroundTubeReportPlayback);
+                        media.__backgroundTubeAttached = true;
+                        media.addEventListener('play', function() {
+                            window.__backgroundTubeShouldResume = true;
+                            window.__backgroundTubeUserPaused = false;
+                            window.__backgroundTubeReportPlayback();
+                        });
+                        media.addEventListener('pause', function() {
+                            window.__backgroundTubeReportPlayback();
+                            setTimeout(window.__backgroundTubeResumeIfNeeded, 250);
+                        });
+                        media.addEventListener('ended', function() {
+                            window.__backgroundTubeShouldResume = false;
+                            window.__backgroundTubeReportPlayback();
+                        });
+                        media.addEventListener('loadedmetadata', window.__backgroundTubeReportPlayback);
+                        media.addEventListener('timeupdate', window.__backgroundTubeReportPlayback);
                     }
                     window.__backgroundTubeReportPlayback();
                 };
@@ -240,12 +308,103 @@ class WebViewManager(
                 var root = document.documentElement || document.body;
                 if (root) {
                     new MutationObserver(function() {
-                        window.__backgroundTubeAttachVideoObservers();
+                        window.__backgroundTubeAttachMediaObservers();
                     }).observe(root, { childList: true, subtree: true });
                 }
 
-                setInterval(window.__backgroundTubeAttachVideoObservers, 2000);
-                window.__backgroundTubeAttachVideoObservers();
+                setInterval(window.__backgroundTubeAttachMediaObservers, 2000);
+                setInterval(window.__backgroundTubeResumeIfNeeded, 1500);
+                window.__backgroundTubeAttachMediaObservers();
+            })();
+            """.trimIndent()
+        )
+    }
+
+    private fun installBackgroundKeepAliveScript() {
+        evaluateJavascript(
+            """
+            (function() {
+                if (window.__backgroundTubeKeepAliveInstalled) {
+                    return;
+                }
+                window.__backgroundTubeKeepAliveInstalled = true;
+                window.__backgroundTubeKeepAliveEnabled = false;
+                window.__backgroundTubeBackgroundMode = false;
+
+                var originalHiddenGetter = function() { return false; };
+                var originalVisibilityGetter = function() { return 'visible'; };
+
+                try {
+                    var hiddenDescriptor =
+                        Object.getOwnPropertyDescriptor(Document.prototype, 'hidden') ||
+                        Object.getOwnPropertyDescriptor(document, 'hidden');
+                    if (hiddenDescriptor && hiddenDescriptor.get) {
+                        originalHiddenGetter = hiddenDescriptor.get.bind(document);
+                    }
+                } catch (ignored) {}
+
+                try {
+                    var visibilityDescriptor =
+                        Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState') ||
+                        Object.getOwnPropertyDescriptor(document, 'visibilityState');
+                    if (visibilityDescriptor && visibilityDescriptor.get) {
+                        originalVisibilityGetter = visibilityDescriptor.get.bind(document);
+                    }
+                } catch (ignored) {}
+
+                try {
+                    Object.defineProperty(document, 'hidden', {
+                        configurable: true,
+                        get: function() {
+                            return window.__backgroundTubeKeepAliveEnabled ? false : originalHiddenGetter();
+                        }
+                    });
+                } catch (ignored) {}
+
+                try {
+                    Object.defineProperty(document, 'visibilityState', {
+                        configurable: true,
+                        get: function() {
+                            return window.__backgroundTubeKeepAliveEnabled ? 'visible' : originalVisibilityGetter();
+                        }
+                    });
+                } catch (ignored) {}
+
+                try {
+                    var originalHasFocus = document.hasFocus ? document.hasFocus.bind(document) : function() { return true; };
+                    document.hasFocus = function() {
+                        return window.__backgroundTubeKeepAliveEnabled ? true : originalHasFocus();
+                    };
+                } catch (ignored) {}
+            })();
+            """.trimIndent()
+        )
+    }
+
+    private fun setBackgroundPlaybackMode(enabled: Boolean) {
+        val jsEnabled = enabled.toString()
+        evaluateJavascript(
+            """
+            (function() {
+                window.__backgroundTubeKeepAliveEnabled = $jsEnabled;
+                window.__backgroundTubeBackgroundMode = $jsEnabled;
+                if ($jsEnabled && window.__backgroundTubeResumeIfNeeded) {
+                    window.__backgroundTubeResumeIfNeeded();
+                }
+            })();
+            """.trimIndent()
+        )
+    }
+
+    private fun resumePrimaryMedia() {
+        evaluateJavascript(
+            """
+            (function() {
+                window.__backgroundTubeUserPaused = false;
+                window.__backgroundTubeShouldResume = true;
+                if (window.__backgroundTubeResumeIfNeeded) {
+                    window.__backgroundTubeResumeIfNeeded();
+                }
             })();
             """.trimIndent()
         )
@@ -261,7 +420,7 @@ class WebViewManager(
 
     private fun normalizeUrl(rawUrl: String?): String {
         val uri = runCatching { Uri.parse(rawUrl) }.getOrNull()
-        return if (uri != null && isHttpUri(uri) && isAllowedInWebView(uri)) {
+        return if (uri != null && isHttpUri(uri)) {
             uri.toString()
         } else {
             AppConstants.DEFAULT_URL
@@ -277,24 +436,12 @@ class WebViewManager(
             return true
         }
 
-        if (isAllowedInWebView(uri)) {
-            return false
-        }
-
-        listener.onExternalUrlRequested(uri)
-        return true
+        return false
     }
 
     private fun isHttpUri(uri: Uri): Boolean {
         return uri.scheme.equals("http", ignoreCase = true) ||
             uri.scheme.equals("https", ignoreCase = true)
-    }
-
-    private fun isAllowedInWebView(uri: Uri): Boolean {
-        val host = uri.host?.lowercase() ?: return false
-        return ALLOWED_HOST_SUFFIXES.any { suffix ->
-            host == suffix || host.endsWith(".$suffix")
-        }
     }
 
     private fun reportPlaybackState(isPlaying: Boolean, title: String?) {
@@ -310,6 +457,14 @@ class WebViewManager(
         lastReportedTitle = cleanTitle
         lastPlaybackReportAt = now
         listener.onPlaybackStateChanged(isPlaying, cleanTitle)
+    }
+
+    private fun blockedResponse(): WebResourceResponse {
+        return WebResourceResponse(
+            "text/plain",
+            "utf-8",
+            ByteArrayInputStream(ByteArray(0))
+        )
     }
 
     private inner class PlaybackBridge {
@@ -329,6 +484,17 @@ class WebViewManager(
             return shouldOverrideNavigation(request)
         }
 
+        override fun shouldInterceptRequest(
+            view: WebView,
+            request: WebResourceRequest
+        ): WebResourceResponse? {
+            return if (contentFilter.shouldBlock(request.url)) {
+                blockedResponse()
+            } else {
+                super.shouldInterceptRequest(view, request)
+            }
+        }
+
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             super.onPageStarted(view, url, favicon)
             sessionStore.saveLastUrl(url)
@@ -340,6 +506,9 @@ class WebViewManager(
             sessionStore.saveLastUrl(url)
             listener.onPageProgress(100)
             injectPlaybackObserver()
+            if (currentSettings.enableBackgroundPlayback && currentSettings.enableScreenOffPlayback) {
+                installBackgroundKeepAliveScript()
+            }
         }
 
         override fun onReceivedError(
@@ -405,17 +574,5 @@ class WebViewManager(
     private companion object {
         const val JS_BRIDGE_NAME = "BackgroundTubeBridge"
         const val PLAYBACK_REPORT_THROTTLE_MS = 2500L
-
-        val ALLOWED_HOST_SUFFIXES = listOf(
-            "youtube.com",
-            "youtu.be",
-            "google.com",
-            "google.co.in",
-            "googleusercontent.com",
-            "gstatic.com",
-            "ytimg.com",
-            "ggpht.com",
-            "doubleclick.net"
-        )
     }
 }

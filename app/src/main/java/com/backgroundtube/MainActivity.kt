@@ -26,25 +26,40 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isVisible
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.backgroundtube.data.SessionStore
+import com.backgroundtube.data.SettingsRepository
+import com.backgroundtube.data.UserSettings
 import com.backgroundtube.databinding.ActivityMainBinding
+import com.backgroundtube.diagnostics.DiagnosticState
+import com.backgroundtube.diagnostics.DiagnosticsStore
 import com.backgroundtube.network.NetworkMonitor
 import com.backgroundtube.playback.MediaPlaybackService
 import com.backgroundtube.playback.PlaybackCommand
 import com.backgroundtube.util.AppConstants
+import com.backgroundtube.web.ContentFilter
 import com.backgroundtube.web.WebViewManager
+import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity(), WebViewManager.Listener {
     private lateinit var binding: ActivityMainBinding
     private lateinit var sessionStore: SessionStore
+    private lateinit var settingsRepository: SettingsRepository
     private lateinit var webViewManager: WebViewManager
     private lateinit var networkMonitor: NetworkMonitor
+    private lateinit var contentFilter: ContentFilter
 
+    private var currentSettings = UserSettings()
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var fullscreenView: View? = null
     private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var receiverRegistered = false
     private var mediaServiceStarted = false
+    private var isApplyingSettingsToUi = false
+    private var isCurrentPlaybackPlaying = false
+    private var currentTitle = ""
     private var lastExitPressAt = 0L
 
     private val fileChooserLauncher = registerForActivityResult(
@@ -72,27 +87,34 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
                 ?: return
             webViewManager.handlePlaybackCommand(command)
             if (command == PlaybackCommand.STOP) {
+                isCurrentPlaybackPlaying = false
                 mediaServiceStarted = false
+                DiagnosticsStore.updatePlayback("Stopped")
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         super.onCreate(savedInstanceState)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         sessionStore = SessionStore(this)
-        webViewManager = WebViewManager(binding.webView, sessionStore, this)
+        settingsRepository = SettingsRepository(this)
+        contentFilter = ContentFilter()
+        webViewManager = WebViewManager(binding.webView, sessionStore, contentFilter, this)
         networkMonitor = NetworkMonitor(this) { isConnected ->
             runOnUiThread { renderNetworkState(isConnected) }
         }
 
         setupSystemBars()
         setupTopBar()
+        setupSettingsPanel()
+        setupDiagnosticsPanel()
         setupBackHandling()
+        observeSettings()
+        observeDiagnostics()
         registerCommandReceiver()
         requestNotificationPermissionIfNeeded()
 
@@ -109,10 +131,19 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
     override fun onResume() {
         super.onResume()
         webViewManager.onResume()
+        if (isCurrentPlaybackPlaying && shouldUseForegroundService()) {
+            mediaServiceStarted = true
+            sendPlaybackStateToService(isPlaying = true, title = currentTitle)
+        }
     }
 
     override fun onPause() {
-        webViewManager.onPause()
+        val keepPlaybackAlive = shouldKeepPlaybackAlive()
+        if (keepPlaybackAlive) {
+            mediaServiceStarted = true
+            sendPlaybackStateToService(isPlaying = true, title = currentTitle)
+        }
+        webViewManager.onPause(keepPlaybackAlive)
         super.onPause()
     }
 
@@ -147,19 +178,22 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
     }
 
     override fun onPageTitleChanged(title: String) {
+        currentTitle = title
         binding.titleText.text = title.ifBlank { getString(R.string.top_bar_title) }
     }
 
     override fun onPlaybackStateChanged(isPlaying: Boolean, title: String) {
+        currentTitle = title
+        isCurrentPlaybackPlaying = isPlaying
         sessionStore.savePlaybackState(isPlaying)
         sessionStore.saveTitle(title)
+        DiagnosticsStore.updatePlayback(if (isPlaying) "Playing" else "Paused")
 
-        if (isPlaying) {
+        if (isPlaying && shouldUseForegroundService()) {
             mediaServiceStarted = true
-        }
-
-        if (mediaServiceStarted) {
-            sendPlaybackStateToService(isPlaying, title)
+            sendPlaybackStateToService(isPlaying = true, title = title)
+        } else if (mediaServiceStarted) {
+            sendPlaybackStateToService(isPlaying = false, title = title)
         }
     }
 
@@ -227,11 +261,52 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
         binding.backButton.setOnClickListener {
             navigateBackOrExit()
         }
+        binding.settingsButton.setOnClickListener {
+            showSettingsPanel(true)
+        }
         binding.refreshButton.setOnClickListener {
             webViewManager.reload()
         }
         binding.openBrowserButton.setOnClickListener {
             openUriExternally(Uri.parse(webViewManager.currentUrl()))
+        }
+        binding.titleText.setOnLongClickListener {
+            showDiagnosticsPanel(true)
+            true
+        }
+    }
+
+    private fun setupSettingsPanel() {
+        binding.settingsCloseButton.setOnClickListener {
+            showSettingsPanel(false)
+        }
+
+        binding.switchBackgroundPlayback.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setBackgroundPlayback(checked) }
+        }
+        binding.switchScreenOffPlayback.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setScreenOffPlayback(checked) }
+        }
+        binding.switchForegroundService.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setForegroundService(checked) }
+        }
+        binding.switchWakeLock.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setWakeLock(checked) }
+        }
+        binding.switchTrackingProtection.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setTrackingProtection(checked) }
+        }
+        binding.switchAdBlocking.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setGenericAdBlocking(checked) }
+        }
+        binding.switchDarkMode.setOnCheckedChangeListener { _, checked ->
+            updateSetting { settingsRepository.setDarkMode(checked) }
+        }
+    }
+
+    private fun setupDiagnosticsPanel() {
+        binding.debugCloseButton.setOnClickListener {
+            showDiagnosticsPanel(false)
         }
     }
 
@@ -240,11 +315,12 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (fullscreenView != null) {
-                        webViewManager.hideCustomView()
-                        return
+                    when {
+                        fullscreenView != null -> webViewManager.hideCustomView()
+                        binding.debugPanel.isVisible -> showDiagnosticsPanel(false)
+                        binding.settingsPanel.isVisible -> showSettingsPanel(false)
+                        else -> navigateBackOrExit()
                     }
-                    navigateBackOrExit()
                 }
             }
         )
@@ -257,6 +333,94 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
         window.navigationBarColor = ContextCompat.getColor(this, R.color.colorSurface)
         WindowInsetsControllerCompat(window, binding.root).isAppearanceLightStatusBars = !isNight
         WindowInsetsControllerCompat(window, binding.root).isAppearanceLightNavigationBars = !isNight
+    }
+
+    private fun observeSettings() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                settingsRepository.settings.collect { settings ->
+                    applySettings(settings)
+                }
+            }
+        }
+    }
+
+    private fun observeDiagnostics() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                DiagnosticsStore.state.collect { state ->
+                    renderDiagnostics(state)
+                }
+            }
+        }
+    }
+
+    private fun applySettings(settings: UserSettings) {
+        currentSettings = settings
+        webViewManager.applyUserSettings(settings)
+        renderSettings(settings)
+        applyDarkModeSetting(settings.darkMode)
+
+        if (!shouldUseForegroundService() && mediaServiceStarted) {
+            stopService(Intent(this, MediaPlaybackService::class.java))
+            mediaServiceStarted = false
+        } else if (isCurrentPlaybackPlaying && shouldUseForegroundService()) {
+            mediaServiceStarted = true
+            sendPlaybackStateToService(isPlaying = true, title = currentTitle)
+        }
+    }
+
+    private fun renderSettings(settings: UserSettings) {
+        isApplyingSettingsToUi = true
+        binding.switchBackgroundPlayback.isChecked = settings.enableBackgroundPlayback
+        binding.switchScreenOffPlayback.isChecked = settings.enableScreenOffPlayback
+        binding.switchForegroundService.isChecked = settings.enableForegroundService
+        binding.switchWakeLock.isChecked = settings.enableWakeLock
+        binding.switchTrackingProtection.isChecked = settings.enableTrackingProtection
+        binding.switchAdBlocking.isChecked = settings.enableGenericAdBlocking
+        binding.switchDarkMode.isChecked = settings.darkMode
+        isApplyingSettingsToUi = false
+    }
+
+    private fun renderDiagnostics(state: DiagnosticState) {
+        binding.debugForegroundServiceText.text = getString(
+            R.string.diagnostics_foreground_service,
+            state.foregroundServiceState
+        )
+        binding.debugWakeLockText.text = getString(
+            R.string.diagnostics_wake_lock,
+            state.wakeLockState
+        )
+        binding.debugMediaSessionText.text = getString(
+            R.string.diagnostics_media_session,
+            state.mediaSessionState
+        )
+        binding.debugPlaybackText.text = getString(
+            R.string.diagnostics_playback,
+            state.playbackState
+        )
+        binding.debugNetworkText.text = getString(
+            R.string.diagnostics_network,
+            state.networkStatus
+        )
+    }
+
+    private fun applyDarkModeSetting(enabled: Boolean) {
+        val targetMode = if (enabled) {
+            AppCompatDelegate.MODE_NIGHT_YES
+        } else {
+            AppCompatDelegate.MODE_NIGHT_NO
+        }
+        if (AppCompatDelegate.getDefaultNightMode() != targetMode) {
+            AppCompatDelegate.setDefaultNightMode(targetMode)
+        }
+    }
+
+    private fun updateSetting(block: suspend () -> Unit) {
+        if (isApplyingSettingsToUi) return
+        lifecycleScope.launch {
+            block()
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -305,6 +469,18 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
 
     private fun renderNetworkState(isConnected: Boolean) {
         binding.offlineBanner.isVisible = !isConnected
+        DiagnosticsStore.updateNetwork(if (isConnected) "Online" else "Offline")
+    }
+
+    private fun shouldUseForegroundService(): Boolean {
+        return currentSettings.enableBackgroundPlayback && currentSettings.enableForegroundService
+    }
+
+    private fun shouldKeepPlaybackAlive(): Boolean {
+        return isCurrentPlaybackPlaying &&
+            currentSettings.enableBackgroundPlayback &&
+            currentSettings.enableScreenOffPlayback &&
+            currentSettings.enableForegroundService
     }
 
     private fun sendPlaybackStateToService(isPlaying: Boolean, title: String) {
@@ -328,6 +504,20 @@ class MainActivity : AppCompatActivity(), WebViewManager.Listener {
             startActivity(Intent.createChooser(intent, getString(R.string.content_open_browser)))
         } catch (exception: ActivityNotFoundException) {
             Toast.makeText(this, R.string.no_browser_found, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showSettingsPanel(show: Boolean) {
+        binding.settingsPanel.isVisible = show
+        if (show) {
+            binding.debugPanel.isVisible = false
+        }
+    }
+
+    private fun showDiagnosticsPanel(show: Boolean) {
+        binding.debugPanel.isVisible = show
+        if (show) {
+            binding.settingsPanel.isVisible = false
         }
     }
 
