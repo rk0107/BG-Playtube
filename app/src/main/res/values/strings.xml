@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BackgroundTube</string>
+    <string name="top_bar_title">BackgroundTube</string>
+    <string name="content_back">Back</string>
+    <string name="content_refresh">Refresh</string>
+    <string name="content_open_browser">Open in browser</string>
+    <string name="offline_message">No internet connection. Playback may continue if the current page is already loaded.</string>
+    <string name="page_load_error">The page could not be loaded. Check your connection and try again.</string>
+    <string name="exit_prompt">Press back again to exit</string>
+    <string name="no_browser_found">No browser is available for this link</string>
+    <string name="notification_channel_name">Media playback</string>
+    <string name="notification_channel_description">Controls BackgroundTube playback while the app is in the background.</string>
+    <string name="notification_title">BackgroundTube</string>
+    <string name="notification_playing">Playing in background</string>
+    <string name="notification_paused">Playback controls available</string>
+    <string name="action_play">Play</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_stop">Stop</string>
+</resources>

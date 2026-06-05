@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="colorPrimary">#67DBBF</color>
+    <color name="colorOnPrimary">#00382F</color>
+    <color name="colorPrimaryContainer">#005146</color>
+    <color name="colorOnPrimaryContainer">#84F8DE</color>
+    <color name="colorSecondary">#B1CCC4</color>
+    <color name="colorBackground">#101412</color>
+    <color name="colorSurface">#101412</color>
+    <color name="colorSurfaceContainer">#1C211F</color>
+    <color name="colorOnSurface">#E0E3E0</color>
+    <color name="colorOutline">#89938F</color>
+    <color name="colorError">#FFB4AB</color>
+    <color name="colorScrim">#000000</color>
+    <color name="progressTrack">#35413D</color>
+</resources>
